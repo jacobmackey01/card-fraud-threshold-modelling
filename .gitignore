@@ -6,3 +6,5 @@ smoke_run/
 __pycache__/
 *.pyc
 .vendor_py/
+.venv/
+monitoring/*.json

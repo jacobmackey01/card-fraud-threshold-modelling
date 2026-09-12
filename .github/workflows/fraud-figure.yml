@@ -27,7 +27,7 @@ jobs:
       - name: Check committed SVG freshness
         run: >-
           python -c "from pathlib import Path; import tempfile; from src.operating_point_figure import render_operating_point_svg;
-          root=Path.cwd(); expected=(root/'reports'/'fraud_operating_point.svg').read_bytes();
+          root=Path.cwd(); expected=(root/'reports'/'fraud_operating_point.svg').read_text(encoding='utf-8');
           output=Path(tempfile.mkdtemp())/'fraud_operating_point.svg';
-          actual=render_operating_point_svg(root, output).read_bytes();
+          actual=render_operating_point_svg(root, output).read_text(encoding='utf-8');
           assert actual == expected, 'reports/fraud_operating_point.svg is stale relative to committed evidence'"

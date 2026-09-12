@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+.vendor_py
+__pycache__
+*.pyc
+data
+interpretation
+reports
+tests
+_smoke_validation
+smoke_run
+*.zip

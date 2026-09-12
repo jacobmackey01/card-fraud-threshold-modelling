@@ -1,6 +1,23 @@
-# Credit Card Fraud Detection Project
+# Credit Card Fraud: Thresholding to Production Inference
 
-This is an end-to-end fraud detection project for the classic public credit-card fraud dataset. It trains imbalance-aware models, chooses an alert threshold from business cost or alert-capacity assumptions, and writes interpretation artifacts that explain what pushes transactions toward a fraud flag.
+This project follows one fraud model from business-aware threshold selection into a deployable inference service. It trains imbalance-aware candidates, selects a review threshold from explicit cost or alert-capacity assumptions, packages the chosen model as an immutable release, and serves versioned predictions through a tested API.
+
+```text
+train candidate -> validate threshold -> package immutable release -> promote pointer
+                                                        |
+                                                        v
+                                         FastAPI -> metrics -> drift check
+```
+
+The output is `review_recommended`, not a declaration that a transaction is fraudulent. The data has anonymised PCA features, the cost assumptions are illustrative, and the model has not been approved for use in a real payment system.
+
+## What this project demonstrates
+
+- Chronological model evaluation and threshold selection tied to explicit review-cost and capacity assumptions.
+- A stable preprocessing/inference contract packaged as an immutable, integrity-checked model release.
+- Strictly validated single and batch scoring through FastAPI.
+- Container, CI, health checks, structured logs, and scrapeable operational metrics.
+- Offline input-drift checks and guarded model promotion or rollback without automatic retraining.
 
 ## Dataset
 
@@ -19,7 +36,7 @@ The dataset is extremely imbalanced: the commonly cited version has 492 frauds o
 
 For this workspace's execution status, see `RUN_STATUS.md`.
 
-## Quick Start
+## Train the candidate model
 
 From this folder:
 
@@ -48,6 +65,70 @@ python -m pip install -r requirements-full.txt
 ```
 
 When scikit-learn is installed, the pipeline automatically adds a `HistGradientBoostingClassifier` challenger. The logistic models remain as interpretable baselines.
+
+## Run the inference API
+
+Install the API dependencies and start the service from the repository root:
+
+```powershell
+python -m pip install -r requirements-api.txt
+python -m uvicorn service.app:app --host 127.0.0.1 --port 8080
+```
+
+The committed production pointer resolves to model release `1.0.0`. At startup, the service verifies the release manifest and model SHA-256 before accepting traffic. A changed artifact, a changed manifest, an unsupported feature order, or an invalid threshold prevents startup.
+
+Send the explicitly synthetic request example:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8080/v1/predictions `
+  -ContentType application/json `
+  -InFile examples/synthetic_transaction.json
+```
+
+Useful endpoints:
+
+- `GET /health/live`: process liveness.
+- `GET /health/ready`: loaded model version and artifact digest.
+- `GET /v1/model`: input contract, threshold, bounded evaluation metadata, and the decision boundary.
+- `POST /v1/predictions`: one score and review recommendation.
+- `POST /v1/predictions/batch`: up to 1,000 transactions.
+- `GET /metrics`: process-lifetime prediction, error, score, and alert-rate metrics in Prometheus text format.
+
+The service accepts `Time`, `Amount`, and `V1` through `V28`. It rejects missing fields, extra fields, negative time or amount, and non-finite values. Request logs contain the model version, score, decision, latency, and an internal request ID; they do not log the input feature vector or caller-supplied transaction ID.
+
+## Build the container
+
+```powershell
+docker build -t fraud-review-api:1.0.0 .
+docker run --rm -p 8080:8080 fraud-review-api:1.0.0
+```
+
+The image runs as a non-root user and includes only the service code and promoted model artifacts. GitHub Actions runs the unit/API tests, the synthetic training smoke test, release verification, and a container build.
+
+## Version and promote a model
+
+Training writes a candidate to `artifacts/fraud_model.json`; it never changes the production pointer. Release packaging and promotion are separate commands:
+
+```powershell
+python -m scripts.package_model --version 1.0.1
+python -m unittest discover -s tests -v
+python -m scripts.promote_model --version 1.0.1 --expected-current 1.0.0
+python -m scripts.promote_model --version 1.0.1 --check
+```
+
+Release directories are immutable. Promotion checks that the production version is still the version the operator reviewed, then atomically replaces the small pointer file. Rollback uses the same promotion command with a previously validated release and the current version supplied through `--expected-current`.
+
+## Check unlabelled production inputs
+
+The offline monitor scores a CSV with the same raw feature contract, compares feature means and scales with the training reference, and checks alert rate against the held-out test reference plus a sampling band:
+
+```powershell
+python -m service.monitor path/to/recent_transactions.csv --output monitoring/latest.json
+```
+
+This is an early-warning check, not performance measurement. Unlabelled data cannot establish recall, missed-fraud losses, or calibration. Those require delayed confirmed outcomes, as described in `MONITORING.md`.
 
 ## What The Pipeline Does
 

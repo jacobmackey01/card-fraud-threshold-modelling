@@ -52,3 +52,17 @@ Threshold ownership should be explicit:
 The shipped pipeline defaults to a cost threshold, but production use should review the cost matrix and alert-capacity budget with those owners before deployment.
 
 The example cost policy is illustrative: false positives use a fixed review/friction cost, while missed fraud uses transaction amount plus a handling cost. Real values should come from chargeback loss history, analyst handling time, customer-contact cost, and product-approved friction tolerance.
+
+## Implemented operational checks
+
+The API exposes process-lifetime counters and gauges at `GET /metrics`: predictions, review recommendations, scoring errors, alert rate, and mean score. Prediction logs record the promoted model version and latency without writing input features or caller-supplied transaction IDs.
+
+For batch checks, run:
+
+```powershell
+python -m service.monitor path/to/recent_transactions.csv --output monitoring/latest.json
+```
+
+The command rejects malformed model inputs, reports mean and scale shifts for all 33 engineered features, and compares the observed alert rate with the held-out test reference plus a three-standard-error sampling band. `--fail-on-alert` returns a non-zero exit code when a warning or failure is present, which allows a scheduled job to gate promotion or page an owner.
+
+These controls are intentionally limited. The process counters reset when an instance restarts, the example service has no durable metrics backend, and mean/scale checks do not replace PSI or segment-level analysis. A real deployment should scrape `/metrics`, retain versioned batch reports, add channel and geography slices from explainable production fields, and join predictions to delayed confirmed outcomes under the organisation's privacy and retention rules.

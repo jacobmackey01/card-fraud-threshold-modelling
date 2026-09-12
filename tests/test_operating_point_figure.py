@@ -97,7 +97,10 @@ class OperatingPointFigureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             generated = render_operating_point_svg(ROOT, Path(directory) / "fraud_operating_point.svg")
             committed = ROOT / "reports" / "fraud_operating_point.svg"
-            self.assertEqual(generated.read_bytes(), committed.read_bytes())
+            self.assertEqual(
+                generated.read_text(encoding="utf-8"),
+                committed.read_text(encoding="utf-8"),
+            )
 
     def test_malformed_curve_probability_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
