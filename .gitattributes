@@ -1,0 +1,2 @@
+# Versioned model releases are signed byte-for-byte. Do not rewrite line endings.
+artifacts/releases/** -text -diff
