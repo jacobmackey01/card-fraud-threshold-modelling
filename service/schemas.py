@@ -61,6 +61,10 @@ class PredictionResponse(BaseModel):
     review_recommended: bool
 
 
+class DemoPredictionResponse(PredictionResponse):
+    fixture_id: str
+
+
 class BatchPredictionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

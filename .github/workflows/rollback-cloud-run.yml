@@ -1,0 +1,96 @@
+name: Roll back Cloud Run synthetic rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_revision:
+        description: Existing immutable Cloud Run revision to restore
+        required: true
+        type: string
+      expected_current_revision:
+        description: Revision that must currently receive 100% of traffic
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cloud-run-synthetic-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: cloud-run-demo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to Google Cloud with GitHub OIDC
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Read the target revision provenance
+        id: target
+        env:
+          TARGET_REVISION: ${{ inputs.target_revision }}
+        run: |
+          revision_json="$(gcloud run revisions describe "${TARGET_REVISION}" \
+              --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" --format=json)"
+          env_value() {
+            jq -er --arg name "$1" '.spec.containers[0].env[] | select(.name == $name) | .value' <<< "${revision_json}"
+          }
+          echo "commit=$(env_value DEPLOYED_GIT_COMMIT)" >> "$GITHUB_OUTPUT"
+          echo "image_digest=$(env_value DEPLOYED_IMAGE_DIGEST)" >> "$GITHUB_OUTPUT"
+          echo "model_release=$(env_value DEPLOYED_MODEL_RELEASE)" >> "$GITHUB_OUTPUT"
+          echo "model_file_sha256=$(env_value DEPLOYED_MODEL_FILE_SHA256)" >> "$GITHUB_OUTPUT"
+          echo "threshold=$(env_value DEPLOYED_DECISION_THRESHOLD)" >> "$GITHUB_OUTPUT"
+          echo "fixture_id=$(env_value DEPLOYED_FIXTURE_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Move traffic only if the expected revision is still serving
+        run: |
+          python -m scripts.cloud_run_traffic \
+            --action rollback \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service "${{ vars.CLOUD_RUN_SERVICE }}" \
+            --expected-current-revision "${{ inputs.expected_current_revision }}" \
+            --target-revision "${{ inputs.target_revision }}" \
+            --output rollback-evidence/traffic.json
+
+      - name: Verify the restored revision through the stable service URL
+        run: |
+          service_url="$(gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE }}" \
+              --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" \
+              --format='value(status.url)')"
+          python -m scripts.verify_deployment \
+            --base-url "${service_url}" \
+            --expected-commit "${{ steps.target.outputs.commit }}" \
+            --expected-container-digest "${{ steps.target.outputs.image_digest }}" \
+            --expected-model-release "${{ steps.target.outputs.model_release }}" \
+            --expected-model-file-digest "${{ steps.target.outputs.model_file_sha256 }}" \
+            --expected-threshold "${{ steps.target.outputs.threshold }}" \
+            --expected-fixture "${{ steps.target.outputs.fixture_id }}" \
+            --output rollback-evidence/live-verification.json
+
+      - name: Record rollback summary
+        run: |
+          {
+            echo "## Guarded Cloud Run rollback"
+            echo "- From revision: ${{ inputs.expected_current_revision }}"
+            echo "- To revision: ${{ inputs.target_revision }}"
+            echo "- Restored commit: ${{ steps.target.outputs.commit }}"
+            echo "- Restored image digest: ${{ steps.target.outputs.image_digest }}"
+            echo "- Live contract verification: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload rollback evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-run-rollback-${{ inputs.target_revision }}
+          path: rollback-evidence/
+          if-no-files-found: error
+          retention-days: 90

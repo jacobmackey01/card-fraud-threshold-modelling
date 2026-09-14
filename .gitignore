@@ -8,3 +8,5 @@ __pycache__/
 .vendor_py/
 .venv/
 monitoring/*.json
+deployment-evidence/
+rollback-evidence/

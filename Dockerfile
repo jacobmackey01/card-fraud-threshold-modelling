@@ -1,5 +1,14 @@
 FROM python:3.12-slim
 
+ARG VCS_REF=unknown
+ARG MODEL_VERSION=unknown
+ARG MODEL_FILE_SHA256=unknown
+
+LABEL org.opencontainers.image.source="https://github.com/jacobmackey01/card-fraud-threshold-modelling" \
+    org.opencontainers.image.revision="${VCS_REF}" \
+    io.card-fraud.model.version="${MODEL_VERSION}" \
+    io.card-fraud.model.file.sha256="${MODEL_FILE_SHA256}"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080
@@ -13,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements-api.txt
 
 COPY service ./service
 COPY artifacts ./artifacts
+COPY examples/synthetic_demo_v1.json ./examples/synthetic_demo_v1.json
 
 USER app
 EXPOSE 8080

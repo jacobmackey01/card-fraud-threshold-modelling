@@ -1,0 +1,278 @@
+name: Deploy synthetic rehearsal to Cloud Run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cloud-run-synthetic-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Compile Python sources
+        run: python -m compileall -q service scripts src tests
+      - name: Run unit and API tests
+        run: python -m unittest discover -s tests -v
+      - name: Verify promoted model bundle
+        run: python -m scripts.promote_model --version 1.0.0 --check
+      - name: Run synthetic pipeline smoke test
+        run: python src/smoke_test.py
+
+  publish-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: cloud-run-demo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require bounded-cost deployment configuration
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
+          GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+          BILLING_ALERT_CONFIRMED: ${{ vars.BILLING_ALERT_CONFIRMED }}
+        run: |
+          required=(
+            GCP_PROJECT_ID GCP_REGION GCP_WIF_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT
+            CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT GAR_REPOSITORY CLOUD_RUN_SERVICE
+          )
+          for name in "${required[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required cloud-run-demo environment variable: ${name}" >&2
+              exit 1
+            fi
+          done
+          if [[ "${BILLING_ALERT_CONFIRMED}" != "true" ]]; then
+            echo "Set BILLING_ALERT_CONFIRMED=true only after a Google Cloud billing alert exists." >&2
+            exit 1
+          fi
+
+      - id: release
+        name: Read immutable model and fixture provenance
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          root = Path.cwd()
+          pointer = json.loads((root / "artifacts/production.json").read_text())
+          manifest = json.loads(
+              (root / "artifacts/releases" / pointer["model_version"] / "manifest.json").read_text()
+          )
+          fixture = json.loads((root / "examples/synthetic_demo_v1.json").read_text())
+          print(f'model_version={pointer["model_version"]}')
+          print(f'model_file_sha256={manifest["artifact_sha256"]}')
+          print(f'threshold={manifest["threshold"]}')
+          print(f'fixture_id={fixture["fixture_id"]}')
+          PY
+
+      - id: auth
+        name: Authenticate to Google Cloud with GitHub OIDC
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Artifact Registry authentication
+        env:
+          GCP_REGION: ${{ vars.GCP_REGION }}
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: image
+        name: Define immutable image reference
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+        run: |
+          short_sha="${GITHUB_SHA:0:12}"
+          image_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/card-fraud-threshold-modelling"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "image_base=${image_base}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${image_base}:commit-${GITHUB_SHA}"
+            echo "${image_base}:model-${{ steps.release.outputs.model_version }}-commit-${GITHUB_SHA}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: build
+        name: Build once and publish to Artifact Registry
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            MODEL_VERSION=${{ steps.release.outputs.model_version }}
+            MODEL_FILE_SHA256=${{ steps.release.outputs.model_file_sha256 }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.card-fraud.model.version=${{ steps.release.outputs.model_version }}
+            io.card-fraud.model.file.sha256=${{ steps.release.outputs.model_file_sha256 }}
+
+      - id: before
+        name: Capture the currently serving revision
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+        run: |
+          if service_json="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" \
+              --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format=json 2>/dev/null)"; then
+            current="$(jq -er '[.status.traffic[] | select(.percent == 100) | .revisionName] | if length == 1 then .[0] else error("expected one 100% traffic revision") end' <<< "${service_json}")"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "revision=${current}" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "revision=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: deploy
+        name: Deploy the exact image digest as an immutable revision
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+          CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
+          IMAGE_BASE: ${{ steps.image.outputs.image_base }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SHORT_SHA: ${{ steps.image.outputs.short_sha }}
+          MODEL_VERSION: ${{ steps.release.outputs.model_version }}
+          MODEL_FILE_SHA256: ${{ steps.release.outputs.model_file_sha256 }}
+          THRESHOLD: ${{ steps.release.outputs.threshold }}
+          FIXTURE_ID: ${{ steps.release.outputs.fixture_id }}
+          SERVICE_EXISTS: ${{ steps.before.outputs.exists }}
+        run: |
+          args=(
+            run deploy "${CLOUD_RUN_SERVICE}"
+            --project "${GCP_PROJECT_ID}"
+            --region "${GCP_REGION}"
+            --image "${IMAGE_BASE}@${IMAGE_DIGEST}"
+            --service-account "${CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT}"
+            --revision-suffix "sha-${SHORT_SHA}"
+            --tag "verify-${SHORT_SHA}"
+            --min-instances 0
+            --max-instances 1
+            --concurrency 4
+            --timeout 10s
+            --cpu 1
+            --memory 512Mi
+            --set-env-vars "SYNTHETIC_DEMO_ONLY=true,DEPLOYED_GIT_COMMIT=${GITHUB_SHA},DEPLOYED_IMAGE_DIGEST=${IMAGE_DIGEST},DEPLOYED_MODEL_RELEASE=${MODEL_VERSION},DEPLOYED_MODEL_FILE_SHA256=${MODEL_FILE_SHA256},DEPLOYED_DECISION_THRESHOLD=${THRESHOLD},DEPLOYED_FIXTURE_VERSION=${FIXTURE_ID}"
+            --quiet
+          )
+          if [[ "${SERVICE_EXISTS}" == "true" ]]; then
+            args+=(--no-traffic)
+          else
+            args+=(--allow-unauthenticated)
+          fi
+          gcloud "${args[@]}"
+          service_json="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" \
+              --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format=json)"
+          revision="$(jq -er '.status.latestCreatedRevisionName' <<< "${service_json}")"
+          tagged_url="$(jq -er --arg tag "verify-${SHORT_SHA}" '.status.traffic[] | select(.tag == $tag) | .url' <<< "${service_json}")"
+          service_url="$(jq -er '.status.url' <<< "${service_json}")"
+          echo "revision=${revision}" >> "$GITHUB_OUTPUT"
+          echo "tagged_url=${tagged_url}" >> "$GITHUB_OUTPUT"
+          echo "service_url=${service_url}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the no-traffic candidate through its tagged URL
+        run: |
+          python -m scripts.verify_deployment \
+            --base-url "${{ steps.deploy.outputs.tagged_url }}" \
+            --expected-commit "${{ github.sha }}" \
+            --expected-container-digest "${{ steps.build.outputs.digest }}" \
+            --expected-model-release "${{ steps.release.outputs.model_version }}" \
+            --expected-model-file-digest "${{ steps.release.outputs.model_file_sha256 }}" \
+            --expected-threshold "${{ steps.release.outputs.threshold }}" \
+            --expected-fixture "${{ steps.release.outputs.fixture_id }}" \
+            --output deployment-evidence/candidate-verification.json
+
+      - name: Guardedly promote the verified revision
+        if: steps.before.outputs.exists == 'true'
+        run: |
+          python -m scripts.cloud_run_traffic \
+            --action promote \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service "${{ vars.CLOUD_RUN_SERVICE }}" \
+            --expected-current-revision "${{ steps.before.outputs.revision }}" \
+            --target-revision "${{ steps.deploy.outputs.revision }}" \
+            --output deployment-evidence/promotion.json
+
+      - name: Record first deployment promotion
+        if: steps.before.outputs.exists != 'true'
+        run: |
+          python - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          Path("deployment-evidence").mkdir(exist_ok=True)
+          Path("deployment-evidence/promotion.json").write_text(json.dumps({
+              "schema_version": 1,
+              "action": "initial_deploy",
+              "status": "passed",
+              "recorded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "to_revision": "${{ steps.deploy.outputs.revision }}",
+              "rollback_status": "pending_first_legitimate_application_update"
+          }, indent=2) + "\n")
+          PY
+
+      - name: Verify the promoted service URL
+        run: |
+          python -m scripts.verify_deployment \
+            --base-url "${{ steps.deploy.outputs.service_url }}" \
+            --expected-commit "${{ github.sha }}" \
+            --expected-container-digest "${{ steps.build.outputs.digest }}" \
+            --expected-model-release "${{ steps.release.outputs.model_version }}" \
+            --expected-model-file-digest "${{ steps.release.outputs.model_file_sha256 }}" \
+            --expected-threshold "${{ steps.release.outputs.threshold }}" \
+            --expected-fixture "${{ steps.release.outputs.fixture_id }}" \
+            --output deployment-evidence/live-verification.json
+
+      - name: Record deploy summary
+        run: |
+          {
+            echo "## Synthetic deployment rehearsal"
+            echo "- Service: ${{ steps.deploy.outputs.service_url }}"
+            echo "- Commit: ${{ github.sha }}"
+            echo "- Image: ${{ steps.image.outputs.image_base }}@${{ steps.build.outputs.digest }}"
+            echo "- Cloud Run revision: ${{ steps.deploy.outputs.revision }}"
+            echo "- Model release: ${{ steps.release.outputs.model_version }}"
+            echo "- Model file digest: ${{ steps.release.outputs.model_file_sha256 }}"
+            echo "- Synthetic fixture: ${{ steps.release.outputs.fixture_id }}"
+            echo "- Rollback: implemented as an approval-protected, explicit revision workflow"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployment evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-run-deployment-${{ github.sha }}
+          path: deployment-evidence/
+          if-no-files-found: error
+          retention-days: 90
