@@ -18,6 +18,7 @@ The output is `review_recommended`, not a declaration that a transaction is frau
 - Strictly validated single and batch scoring through FastAPI.
 - Container, CI, health checks, structured logs, and scrapeable operational metrics.
 - Offline input-drift checks and guarded model promotion or rollback without automatic retraining.
+- A single-artifact synthetic deployment rehearsal: tested container, Artifact Registry digest, immutable Cloud Run revision, live provenance checks, and approval-gated application rollback.
 
 ## Dataset
 
@@ -97,6 +98,22 @@ Useful endpoints:
 - `GET /metrics`: process-lifetime prediction, error, score, and alert-rate metrics in Prometheus text format.
 
 The service accepts `Time`, `Amount`, and `V1` through `V28`. It rejects missing fields, extra fields, negative time or amount, and non-finite values. Request logs contain the model version, score, decision, latency, and an internal request ID; they do not log the input feature vector or caller-supplied transaction ID.
+
+## Rehearse the deployment lifecycle
+
+The public Cloud Run configuration is intentionally narrower than the local inference API. It sets `SYNTHETIC_DEMO_ONLY=true`, removes the arbitrary-vector prediction and batch routes, and exposes one bodyless route:
+
+```text
+POST /v1/demo-prediction
+```
+
+That route loads the versioned, checked-in `examples/synthetic_demo_v1.json` fixture inside the container. It returns the fixture ID, model release, threshold, score and review recommendation. It never accepts transaction features from a caller.
+
+The approval-protected deployment workflow tests the repository, builds and publishes one container to Google Artifact Registry, then deploys that exact `@sha256:...` digest to an immutable Cloud Run revision. It verifies `/health/ready`, `/v1/model`, `/v1/demo-prediction` and `/metrics`, recording the Git commit, container digest, model-file digest, model release, threshold, fixture version and verification time as a GitHub Actions artifact.
+
+Application rollback is a separate approval-protected workflow. It requires an explicit target revision and an expected current revision, moves traffic only when that compare-and-swap guard passes, and reruns the same live verification. It does not create another model release. Live rollback evidence remains pending until a genuine later application revision exists.
+
+See `deployment/README.md` for the bounded-cost Cloud Run configuration and one-time OIDC/WIF setup.
 
 ## Build the container
 

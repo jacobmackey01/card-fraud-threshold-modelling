@@ -32,5 +32,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build production image
-        run: docker build --tag fraud-review-api:${{ github.sha }} .
+      - name: Build the synthetic rehearsal image
+        run: |
+          docker build \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg MODEL_VERSION=1.0.0 \
+            --build-arg MODEL_FILE_SHA256=9800efa3737531fdd0df78bcbb782dd0108cbfca593a76d33f0f534a1842645d \
+            --tag fraud-review-api:${{ github.sha }} .
+      - name: Verify the API from inside the built container
+        run: |
+          image_digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          docker run --detach --rm --name fraud-review-api -p 8080:8080 \
+            -e SYNTHETIC_DEMO_ONLY=true \
+            -e DEPLOYED_GIT_COMMIT=${{ github.sha }} \
+            -e DEPLOYED_IMAGE_DIGEST=${image_digest} \
+            fraud-review-api:${{ github.sha }}
+          trap 'docker logs fraud-review-api; docker stop fraud-review-api' EXIT
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:8080/health/ready >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          python -m scripts.verify_deployment \
+            --base-url http://127.0.0.1:8080 \
+            --expected-commit "${{ github.sha }}" \
+            --expected-container-digest "${image_digest}" \
+            --expected-model-release 1.0.0 \
+            --expected-model-file-digest 9800efa3737531fdd0df78bcbb782dd0108cbfca593a76d33f0f534a1842645d \
+            --expected-threshold 0.053668899607021495 \
+            --expected-fixture synthetic-demo-v1 \
+            --output /tmp/container-verification.json
