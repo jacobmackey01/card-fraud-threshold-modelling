@@ -1,8 +1,6 @@
 name: Deploy synthetic rehearsal to Cloud Run
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -200,6 +198,38 @@ jobs:
           echo "tagged_url=${tagged_url}" >> "$GITHUB_OUTPUT"
           echo "service_url=${service_url}" >> "$GITHUB_OUTPUT"
 
+      - name: Assert the Cloud Run revision uses the published image digest
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          REVISION: ${{ steps.deploy.outputs.revision }}
+          EXPECTED_IMAGE: ${{ steps.image.outputs.image_base }}@${{ steps.build.outputs.digest }}
+        run: |
+          revision_json="$(gcloud run revisions describe "${REVISION}" \
+              --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format=json)"
+          configured_image="$(jq -er '.spec.containers[0].image' <<< "${revision_json}")"
+          if [[ "${configured_image}" != "${EXPECTED_IMAGE}" ]]; then
+            echo "Cloud Run revision image mismatch" >&2
+            echo "Expected: ${EXPECTED_IMAGE}" >&2
+            echo "Actual:   ${configured_image}" >&2
+            exit 1
+          fi
+          mkdir -p deployment-evidence
+          jq -n \
+            --arg revision "${REVISION}" \
+            --arg expected_image "${EXPECTED_IMAGE}" \
+            --arg configured_image "${configured_image}" \
+            --arg checked_at_utc "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            '{
+              schema_version: 1,
+              check: "cloud_run_revision_image_digest",
+              status: "passed",
+              checked_at_utc: $checked_at_utc,
+              revision: $revision,
+              expected_image: $expected_image,
+              configured_image: $configured_image
+            }' > deployment-evidence/revision-image.json
+
       - name: Verify the no-traffic candidate through its tagged URL
         run: |
           python -m scripts.verify_deployment \
@@ -263,6 +293,7 @@ jobs:
             echo "- Commit: ${{ github.sha }}"
             echo "- Image: ${{ steps.image.outputs.image_base }}@${{ steps.build.outputs.digest }}"
             echo "- Cloud Run revision: ${{ steps.deploy.outputs.revision }}"
+            echo "- Cloud Run revision image assertion: passed"
             echo "- Model release: ${{ steps.release.outputs.model_version }}"
             echo "- Model file digest: ${{ steps.release.outputs.model_file_sha256 }}"
             echo "- Synthetic fixture: ${{ steps.release.outputs.fixture_id }}"

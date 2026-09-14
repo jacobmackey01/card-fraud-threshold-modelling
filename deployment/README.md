@@ -9,6 +9,7 @@ tested Git commit
   -> one container build
   -> Artifact Registry digest
   -> Cloud Run revision pinned to that digest
+  -> independent revision image-digest assertion
   -> tagged candidate verification
   -> guarded traffic promotion
   -> stable-URL verification record
@@ -46,13 +47,14 @@ The deployment identity should have only the permissions needed for Artifact Reg
 
 `.github/workflows/deploy-cloud-run.yml`:
 
-1. Runs the complete test and release-integrity suite.
+1. Runs manually after the cloud environment has been provisioned and approved, then executes the complete test and release-integrity suite.
 2. Builds the container once and publishes a commit-addressed image to Artifact Registry.
 3. Captures the registry digest and deploys `IMAGE@sha256:...`, never a mutable tag.
-4. Creates a zero-traffic tagged candidate when the service already exists.
-5. Verifies the candidate's commit, container digest, model-file digest, release, threshold and fixture version.
-6. Moves traffic only if the previously observed revision still owns 100% of traffic.
-7. Repeats verification through the stable service URL and uploads the evidence JSON for 90 days.
+4. Queries the created Cloud Run revision and independently asserts that its configured image is the published digest.
+5. Creates a zero-traffic tagged candidate when the service already exists.
+6. Verifies the candidate's commit, container digest, model-file digest, release, threshold and fixture version.
+7. Moves traffic only if the previously observed revision still owns 100% of traffic.
+8. Repeats verification through the stable service URL and uploads the evidence JSON for 90 days.
 
 Cloud Run is limited to zero minimum instances, one maximum instance, four concurrent requests and a ten-second timeout. The workflow refuses to deploy unless `BILLING_ALERT_CONFIRMED=true`.
 
